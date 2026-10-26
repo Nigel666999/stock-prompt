@@ -14,6 +14,7 @@ SERVER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SERVER)
 
 import marketgraph_mcp.symbols as SYMBOLS
+import marketgraph_mcp.cache as CACHE_MODULE
 
 
 class MarketGraphMCPServerTest(unittest.TestCase):
@@ -72,6 +73,33 @@ class MarketGraphMCPServerTest(unittest.TestCase):
         self.assertEqual(SERVER.get_cached("test_key"), {"val": 123})
         SERVER.set_cached("test_expired", {"val": 456}, ttl=-1)
         self.assertIsNone(SERVER.get_cached("test_expired"))
+
+    def test_cache_lru_eviction(self):
+        """测试缓存达到最大容量时自动按 LRU 淘汰最久未访问条目"""
+        with patch.object(CACHE_MODULE, "MAX_CACHE_ENTRIES", 5):
+            for i in range(5):
+                SERVER.set_cached(f"k{i}", f"v{i}", ttl=60)
+            
+            # 访问 k0，使其变为最近访问
+            self.assertEqual(SERVER.get_cached("k0"), "v0")
+            
+            # 再写入一个新条目 k5，此时应淘汰最久未访问的条目（k1）
+            SERVER.set_cached("k5", "v5", ttl=60)
+            
+            self.assertIsNotNone(SERVER.get_cached("k0"))
+            self.assertIsNotNone(SERVER.get_cached("k5"))
+            self.assertIsNone(SERVER.get_cached("k1"))
+
+    def test_cache_active_expiry_cleanup(self):
+        """测试主动过期扫描机制与写入时的主动清扫"""
+        SERVER.set_cached("k_valid", "ok", ttl=100)
+        SERVER.set_cached("k_expired1", "dead", ttl=-1)
+        SERVER.set_cached("k_expired2", "dead", ttl=-1)
+        self.assertEqual(len(SERVER.CACHE_STORE), 3)
+        cleaned = SERVER.cleanup_expired_cache()
+        self.assertEqual(cleaned, 2)
+        self.assertEqual(len(SERVER.CACHE_STORE), 1)
+        self.assertIn("k_valid", SERVER.CACHE_STORE)
 
     @patch.object(SERVER, "http_get")
     def test_fetch_stock_quote_parsing(self, mock_get):
@@ -1191,6 +1219,83 @@ class MarketGraphMCPServerTest(unittest.TestCase):
         with patch("urllib.request.urlopen", return_value=MockResp()):
             SERVER.http_get("https://push2.eastmoney.com/x?ok=1")
         self.assertNotIn(host, SERVER._HOST_FAILURE_STATE)
+
+    def test_circuit_breaker_half_open_probe_success(self):
+        """熔断冷却期满后转为半开，单次试探成功后彻底恢复"""
+        host = "push2.eastmoney.com"
+        for _ in range(SERVER.BREAKER_FAILURE_THRESHOLD):
+            SERVER._breaker_record_failure(host)
+        self.assertIsNotNone(SERVER._HOST_FAILURE_STATE[host]["opened_at"])
+
+        # 模拟冷却期已过 (快进时间)
+        SERVER._HOST_FAILURE_STATE[host]["opened_at"] -= (SERVER.BREAKER_COOLDOWN_SECONDS + 10)
+
+        class MockResp:
+            def read(self, n=-1):
+                return b'{"probe": "ok"}'
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        with patch("urllib.request.urlopen", return_value=MockResp()):
+            res = SERVER.http_get(f"https://{host}/api/test")
+            self.assertEqual(res, '{"probe": "ok"}')
+
+        self.assertNotIn(host, SERVER._HOST_FAILURE_STATE)
+
+    def test_circuit_breaker_half_open_failure_reopens_with_backoff(self):
+        """半开试探失败后重新熔断，且冷却时间翻倍退避"""
+        host = "push2.eastmoney.com"
+        for _ in range(SERVER.BREAKER_FAILURE_THRESHOLD):
+            SERVER._breaker_record_failure(host)
+
+        SERVER._HOST_FAILURE_STATE[host]["opened_at"] -= (SERVER.BREAKER_COOLDOWN_SECONDS + 10)
+
+        err = urllib.error.HTTPError(f"https://{host}/api/test", 503, "Unavailable", None, io.BytesIO(b""))
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(urllib.error.HTTPError):
+                SERVER.http_get(f"https://{host}/api/test")
+
+        rec = SERVER._HOST_FAILURE_STATE[host]
+        self.assertIsNotNone(rec["opened_at"])
+        self.assertEqual(rec["state"], "open")
+        self.assertGreater(rec["cooldown"], SERVER.BREAKER_COOLDOWN_SECONDS)
+
+    def test_circuit_breaker_half_open_blocks_concurrency(self):
+        """处于半开状态且探测进行中时，拦截并发请求"""
+        host = "push2.eastmoney.com"
+        for _ in range(SERVER.BREAKER_FAILURE_THRESHOLD):
+            SERVER._breaker_record_failure(host)
+
+        SERVER._HOST_FAILURE_STATE[host]["opened_at"] -= (SERVER.BREAKER_COOLDOWN_SECONDS + 10)
+
+        SERVER._breaker_check(host)
+        self.assertEqual(SERVER._HOST_FAILURE_STATE[host]["state"], "half_open")
+        self.assertTrue(SERVER._HOST_FAILURE_STATE[host]["half_open_in_flight"])
+
+        with self.assertRaises(ConnectionError) as cm:
+            SERVER._breaker_check(host)
+        self.assertIn("半开试探状态", str(cm.exception))
+
+    def test_http_retry_jittered_backoff(self):
+        """网络异常重试时触发带抖动的退避等待"""
+        url = "https://push2.eastmoney.com/retry/test"
+        class MockResp:
+            def read(self, n=-1):
+                return b'{"retry": "success"}'
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        with patch("urllib.request.urlopen", side_effect=[OSError("transient net error"), MockResp()]):
+            res = SERVER.http_get(url)
+            self.assertEqual(res, '{"retry": "success"}')
+
+        self.assertTrue(self.sleep_mock.called)
+        backoff_calls = [arg[0][0] for arg in self.sleep_mock.call_args_list if arg[0][0] >= 0.4]
+        self.assertGreaterEqual(len(backoff_calls), 1)
 
     def test_ttl_for_history_long_caches_completed_days(self):
         """收盘定格的历史日期用长缓存, 当日或无日期用短缓存"""

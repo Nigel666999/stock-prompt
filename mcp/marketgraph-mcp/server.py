@@ -33,6 +33,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from marketgraph_mcp.cache import (
     CACHE_STORE, CACHE_TTL_SECONDS, HISTORICAL_CACHE_TTL_SECONDS,
+    MAX_CACHE_ENTRIES, cleanup_expired_cache,
     get_cached, set_cached, ttl_for_history,
 )
 from marketgraph_mcp.symbols import (
@@ -41,7 +42,8 @@ from marketgraph_mcp.symbols import (
 )
 from marketgraph_mcp.schemas import AVAILABLE_TOOLS
 from marketgraph_mcp.transport import (
-    ALLOWED_HTTP_HOSTS, BREAKER_COOLDOWN_SECONDS, BREAKER_FAILURE_THRESHOLD,
+    ALLOWED_HTTP_HOSTS, BREAKER_COOLDOWN_SECONDS, BREAKER_MAX_COOLDOWN_SECONDS,
+    BREAKER_FAILURE_THRESHOLD,
     HOST_MIN_INTERVAL_SECONDS, MAX_HTTP_RESPONSE_BYTES, USER_AGENT,
     _HOST_FAILURE_STATE, _HOST_LAST_REQUEST, _breaker_check,
     _breaker_record_failure, _breaker_record_success, _throttle_host, http_get,
