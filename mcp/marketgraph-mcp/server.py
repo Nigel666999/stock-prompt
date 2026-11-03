@@ -17,9 +17,10 @@ import re
 import urllib.request
 import urllib.error
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 PROJECT_ROOT = next(
@@ -2896,74 +2897,109 @@ def _make_context_envelope(
     return envelope
 
 
+MAX_CONTEXT_WORKERS = 6
+
+
+def _run_parallel_tasks(
+    tasks: Dict[str, Callable[[], Any]],
+    max_workers: int = MAX_CONTEXT_WORKERS,
+) -> Dict[str, Tuple[Optional[Any], Optional[Exception]]]:
+    """并发执行一组无依赖的数据抓取任务，收集执行结果或捕获异常。"""
+    results: Dict[str, Tuple[Optional[Any], Optional[Exception]]] = {}
+    if not tasks:
+        return results
+    worker_count = min(len(tasks), max(max_workers, 1))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {executor.submit(fn): name for name, fn in tasks.items()}
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                res = future.result()
+                results[name] = (res, None)
+            except Exception as exc:
+                results[name] = (None, exc)
+    return results
+
+
 def fetch_preopen_context(
     indices: Optional[List[str]] = None,
     date_str: Optional[str] = None,
     sectors: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """聚合 A 股盘前推演标准化证据包：T-1 指数日K与点位、市场情绪、连板天梯、市场广度"""
+    """聚合 A 股盘前推演标准化证据包：T-1 指数日K与点位、市场情绪、连板天梯、市场广度（并发多线程）"""
     idx_keys = indices or ["SHCI", "SZCI", "CYB", "CSIALL"]
     missing: List[str] = []
     conflicts: List[str] = []
     payload: Dict[str, Any] = {}
     data_date = None
 
-    try:
-        idx_res = fetch_index_kline(idx_keys, count=20)
-        if isinstance(idx_res, dict) and idx_res.get("data_status") != "unavailable" and not idx_res.get("error"):
-            payload["indices"] = idx_res.get("indices", {})
-            data_date = index_latest_date(idx_res)
-        else:
-            missing.append("indices")
-    except Exception as exc:
-        missing.append(f"indices({exc})")
+    tasks = {
+        "indices": lambda: fetch_index_kline(idx_keys, count=20),
+        "sentiment": lambda: fetch_market_sentiment(date_str),
+        "ladder": lambda: fetch_limit_up_ladder(date_str),
+        "breadth": lambda: fetch_market_breadth(days=2),
+    }
+    task_res = _run_parallel_tasks(tasks)
 
-    try:
-        sent_res = fetch_market_sentiment(date_str)
-        if isinstance(sent_res, dict) and sent_res.get("data_status") != "unavailable" and not sent_res.get("error"):
-            payload["sentiment"] = sent_res
-            if not data_date:
-                data_date = sent_res.get("date")
-        else:
-            missing.append("sentiment")
-    except Exception as exc:
-        missing.append(f"sentiment({exc})")
+    # 1. indices
+    idx_res, idx_exc = task_res.get("indices", (None, None))
+    if idx_exc is not None:
+        missing.append(f"indices({idx_exc})")
+    elif isinstance(idx_res, dict) and idx_res.get("data_status") != "unavailable" and not idx_res.get("error"):
+        payload["indices"] = idx_res.get("indices", {})
+        data_date = index_latest_date(idx_res)
+    else:
+        missing.append("indices")
 
-    try:
-        ladder_res = fetch_limit_up_ladder(date_str)
-        if isinstance(ladder_res, dict) and ladder_res.get("data_status") != "unavailable" and not ladder_res.get("error"):
-            payload["ladder_summary"] = {
-                "max_height": ladder_res.get("max_height"),
-                "total_limit_up": ladder_res.get("total_limit_up"),
-                "ladder_distribution": ladder_res.get("ladder_distribution", {}),
-                "highest_tier_stocks": ladder_res.get("highest_tier_stocks", []),
-            }
-        else:
-            missing.append("ladder")
-    except Exception as exc:
-        missing.append(f"ladder({exc})")
+    # 2. sentiment
+    sent_res, sent_exc = task_res.get("sentiment", (None, None))
+    if sent_exc is not None:
+        missing.append(f"sentiment({sent_exc})")
+    elif isinstance(sent_res, dict) and sent_res.get("data_status") != "unavailable" and not sent_res.get("error"):
+        payload["sentiment"] = sent_res
+        if not data_date:
+            data_date = sent_res.get("date")
+    else:
+        missing.append("sentiment")
 
-    try:
-        breadth_res = fetch_market_breadth(days=2)
-        if isinstance(breadth_res, dict) and breadth_res.get("data_status") != "unavailable" and not breadth_res.get("error"):
-            payload["breadth"] = breadth_res
-        else:
-            missing.append("breadth")
-    except Exception as exc:
-        missing.append(f"breadth({exc})")
+    # 3. ladder
+    ladder_res, ladder_exc = task_res.get("ladder", (None, None))
+    if ladder_exc is not None:
+        missing.append(f"ladder({ladder_exc})")
+    elif isinstance(ladder_res, dict) and ladder_res.get("data_status") != "unavailable" and not ladder_res.get("error"):
+        payload["ladder_summary"] = {
+            "max_height": ladder_res.get("max_height"),
+            "total_limit_up": ladder_res.get("total_limit_up"),
+            "ladder_distribution": ladder_res.get("ladder_distribution", {}),
+            "highest_tier_stocks": ladder_res.get("highest_tier_stocks", []),
+        }
+    else:
+        missing.append("ladder")
+
+    # 4. breadth
+    breadth_res, breadth_exc = task_res.get("breadth", (None, None))
+    if breadth_exc is not None:
+        missing.append(f"breadth({breadth_exc})")
+    elif isinstance(breadth_res, dict) and breadth_res.get("data_status") != "unavailable" and not breadth_res.get("error"):
+        payload["breadth"] = breadth_res
+    else:
+        missing.append("breadth")
 
     if sectors and isinstance(sectors, list):
-        sector_results = {}
-        for s in sectors:
-            if isinstance(s, str) and s.strip():
-                try:
-                    q_res = fetch_sector_limit_quality(s.strip(), date_str)
-                    if isinstance(q_res, dict) and not q_res.get("error"):
-                        sector_results[s.strip()] = q_res
-                except Exception:
-                    pass
-        if sector_results:
-            payload["sectors_preview"] = sector_results
+        clean_sectors = [s.strip() for s in sectors if isinstance(s, str) and s.strip()]
+        if clean_sectors:
+            sec_tasks = {
+                s: (lambda sec=s: fetch_sector_limit_quality(sec, date_str))
+                for s in clean_sectors
+            }
+            sec_task_res = _run_parallel_tasks(sec_tasks)
+            sector_results = {}
+            for s in clean_sectors:
+                q_res, q_exc = sec_task_res.get(s, (None, None))
+                if q_exc is None and isinstance(q_res, dict) and not q_res.get("error"):
+                    sector_results[s] = q_res
+            if sector_results:
+                payload["sectors_preview"] = sector_results
 
     return _make_context_envelope("Preopen", payload, missing, conflicts, data_date)
 
@@ -2972,83 +3008,100 @@ def fetch_close_review_context(
     date_str: Optional[str] = None,
     top_sectors_count: int = 5,
 ) -> Dict[str, Any]:
-    """聚合 A 股收盘复盘标准化证据包：收盘核心指数、情绪指标、广度红盘率、主力资金板块及领头封板质量"""
+    """聚合 A 股收盘复盘标准化证据包：收盘核心指数、情绪指标、广度红盘率、主力资金板块及领头封板质量（并发多线程）"""
     missing: List[str] = []
     conflicts: List[str] = []
     payload: Dict[str, Any] = {}
     data_date = None
 
-    try:
-        idx_res = fetch_index_kline(["SHCI", "SZCI", "CYB", "CSIALL", "HS300"], count=2)
-        if isinstance(idx_res, dict) and idx_res.get("data_status") != "unavailable" and not idx_res.get("error"):
-            payload["indices"] = idx_res.get("indices", {})
-            data_date = index_latest_date(idx_res)
-        else:
-            missing.append("indices")
-    except Exception as exc:
-        missing.append(f"indices({exc})")
+    tasks = {
+        "indices": lambda: fetch_index_kline(["SHCI", "SZCI", "CYB", "CSIALL", "HS300"], count=2),
+        "sentiment": lambda: fetch_market_sentiment(date_str),
+        "breadth": lambda: fetch_market_breadth(days=2),
+        "sector_fund_flow": lambda: fetch_sector_fund_flow(count=max(top_sectors_count, 1), days=1),
+        "ladder": lambda: fetch_limit_up_ladder(date_str),
+        "longhubang": lambda: fetch_longhubang_detail(date_str=date_str),
+    }
+    task_res = _run_parallel_tasks(tasks)
 
-    try:
-        sent_res = fetch_market_sentiment(date_str)
-        if isinstance(sent_res, dict) and sent_res.get("data_status") != "unavailable" and not sent_res.get("error"):
-            payload["sentiment"] = sent_res
-            if not data_date:
-                data_date = sent_res.get("date")
-        else:
-            missing.append("sentiment")
-    except Exception as exc:
-        missing.append(f"sentiment({exc})")
+    # 1. indices
+    idx_res, idx_exc = task_res.get("indices", (None, None))
+    if idx_exc is not None:
+        missing.append(f"indices({idx_exc})")
+    elif isinstance(idx_res, dict) and idx_res.get("data_status") != "unavailable" and not idx_res.get("error"):
+        payload["indices"] = idx_res.get("indices", {})
+        data_date = index_latest_date(idx_res)
+    else:
+        missing.append("indices")
 
-    try:
-        breadth_res = fetch_market_breadth(days=2)
-        if isinstance(breadth_res, dict) and breadth_res.get("data_status") != "unavailable" and not breadth_res.get("error"):
-            payload["breadth"] = breadth_res
-        else:
-            missing.append("breadth")
-    except Exception as exc:
-        missing.append(f"breadth({exc})")
+    # 2. sentiment
+    sent_res, sent_exc = task_res.get("sentiment", (None, None))
+    if sent_exc is not None:
+        missing.append(f"sentiment({sent_exc})")
+    elif isinstance(sent_res, dict) and sent_res.get("data_status") != "unavailable" and not sent_res.get("error"):
+        payload["sentiment"] = sent_res
+        if not data_date:
+            data_date = sent_res.get("date")
+    else:
+        missing.append("sentiment")
 
-    try:
-        fund_res = fetch_sector_fund_flow(count=max(top_sectors_count, 1), days=1)
-        if isinstance(fund_res, dict) and fund_res.get("data_status") != "unavailable" and not fund_res.get("error"):
-            payload["top_fund_flow_sectors"] = fund_res.get("top_inflow_sectors", []) or fund_res.get("top_gainer_sectors", []) or fund_res.get("rankings", [])
-        else:
-            missing.append("sector_fund_flow")
-    except Exception as exc:
-        missing.append(f"sector_fund_flow({exc})")
+    # 3. breadth
+    breadth_res, breadth_exc = task_res.get("breadth", (None, None))
+    if breadth_exc is not None:
+        missing.append(f"breadth({breadth_exc})")
+    elif isinstance(breadth_res, dict) and breadth_res.get("data_status") != "unavailable" and not breadth_res.get("error"):
+        payload["breadth"] = breadth_res
+    else:
+        missing.append("breadth")
 
-    try:
-        ladder_res = fetch_limit_up_ladder(date_str)
-        if isinstance(ladder_res, dict) and ladder_res.get("data_status") != "unavailable" and not ladder_res.get("error"):
-            payload["limit_up_ladder"] = ladder_res
-        else:
-            missing.append("ladder")
-    except Exception as exc:
-        missing.append(f"ladder({exc})")
+    # 4. sector_fund_flow
+    fund_res, fund_exc = task_res.get("sector_fund_flow", (None, None))
+    if fund_exc is not None:
+        missing.append(f"sector_fund_flow({fund_exc})")
+    elif isinstance(fund_res, dict) and fund_res.get("data_status") != "unavailable" and not fund_res.get("error"):
+        payload["top_fund_flow_sectors"] = fund_res.get("top_inflow_sectors", []) or fund_res.get("top_gainer_sectors", []) or fund_res.get("rankings", [])
+    else:
+        missing.append("sector_fund_flow")
 
-    try:
-        lhb_res = fetch_longhubang_detail(date_str=date_str)
-        if isinstance(lhb_res, dict) and lhb_res.get("data_status") != "unavailable" and not lhb_res.get("error"):
-            payload["longhubang"] = lhb_res
-        else:
-            missing.append("longhubang")
-    except Exception as exc:
-        missing.append(f"longhubang({exc})")
+    # 5. ladder
+    ladder_res, ladder_exc = task_res.get("ladder", (None, None))
+    if ladder_exc is not None:
+        missing.append(f"ladder({ladder_exc})")
+    elif isinstance(ladder_res, dict) and ladder_res.get("data_status") != "unavailable" and not ladder_res.get("error"):
+        payload["limit_up_ladder"] = ladder_res
+    else:
+        missing.append("ladder")
 
+    # 6. longhubang
+    lhb_res, lhb_exc = task_res.get("longhubang", (None, None))
+    if lhb_exc is not None:
+        missing.append(f"longhubang({lhb_exc})")
+    elif isinstance(lhb_res, dict) and lhb_res.get("data_status") != "unavailable" and not lhb_res.get("error"):
+        payload["longhubang"] = lhb_res
+    else:
+        missing.append("longhubang")
+
+    # 阶段2：前 2 个板块领头封板质量并发抓取
     rankings = payload.get("top_fund_flow_sectors", [])
     if rankings:
-        sampled_qualities = {}
+        sampled_names = []
         for item in rankings[:2]:
             sec_name = item.get("sector_name") or item.get("name")
             if sec_name:
-                try:
-                    q = fetch_sector_limit_quality(sec_name, date_str)
-                    if isinstance(q, dict) and not q.get("error"):
-                        sampled_qualities[sec_name] = q
-                except Exception:
-                    pass
-        if sampled_qualities:
-            payload["mainline_limit_quality"] = sampled_qualities
+                sampled_names.append(sec_name)
+        if sampled_names:
+            quality_tasks = {
+                name: (lambda n=name: fetch_sector_limit_quality(n, date_str))
+                for name in sampled_names
+            }
+            quality_res = _run_parallel_tasks(quality_tasks, max_workers=2)
+            sampled_qualities = {}
+            for name in sampled_names:
+                q, q_exc = quality_res.get(name, (None, None))
+                if q_exc is None and isinstance(q, dict) and not q.get("error"):
+                    sampled_qualities[name] = q
+            if sampled_qualities:
+                payload["mainline_limit_quality"] = sampled_qualities
 
     indices_data = payload.get("indices", {})
     sh_info = indices_data.get("SHCI", {}) or indices_data.get("sh000001", {})
@@ -3110,7 +3163,7 @@ def fetch_rotation_context(
     days: int = 5,
     sector_count: int = 10,
 ) -> Dict[str, Any]:
-    """聚合 A 股 N 日板块轮动标准化证据包。
+    """聚合 A 股 N 日板块轮动标准化证据包（并发多线程）。
 
     payload 固定包含 5 个板块：
     - sector_fund_flows      行业主力净流入/净流出与涨幅榜（东财行业口径）
@@ -3124,36 +3177,43 @@ def fetch_rotation_context(
     payload: Dict[str, Any] = {}
     data_date = None
 
-    try:
-        fund_res = fetch_sector_fund_flow(count=sector_count, days=days)
-        if isinstance(fund_res, dict) and fund_res.get("data_status") != "unavailable" and not fund_res.get("error"):
-            payload["sector_fund_flows"] = fund_res
-        else:
-            missing.append("sector_fund_flows")
-    except Exception as exc:
-        missing.append(f"sector_fund_flows({exc})")
+    tasks = {
+        "sector_fund_flows": lambda: fetch_sector_fund_flow(count=sector_count, days=days),
+        "index_trend": lambda: fetch_index_kline(["SHCI", "CYB", "CSIALL"], count=days),
+        "breadth_trend": lambda: fetch_market_breadth(days=days),
+    }
+    task_res = _run_parallel_tasks(tasks)
 
-    try:
-        idx_res = fetch_index_kline(["SHCI", "CYB", "CSIALL"], count=days)
-        if isinstance(idx_res, dict) and idx_res.get("data_status") != "unavailable" and not idx_res.get("error"):
-            payload["index_trend"] = idx_res.get("indices", {})
-            # 交易日期一律以指数K线的真实最新交易日为准；资金流信封只带采集 timestamp，不能当交易日。
-            data_date = data_date or index_latest_date(idx_res)
-        else:
-            missing.append("index_trend")
-    except Exception as exc:
-        missing.append(f"index_trend({exc})")
+    # 1. sector_fund_flows
+    fund_res, fund_exc = task_res.get("sector_fund_flows", (None, None))
+    if fund_exc is not None:
+        missing.append(f"sector_fund_flows({fund_exc})")
+    elif isinstance(fund_res, dict) and fund_res.get("data_status") != "unavailable" and not fund_res.get("error"):
+        payload["sector_fund_flows"] = fund_res
+    else:
+        missing.append("sector_fund_flows")
 
-    try:
-        breadth_res = fetch_market_breadth(days=days)
-        if isinstance(breadth_res, dict) and breadth_res.get("data_status") != "unavailable" and not breadth_res.get("error"):
-            payload["breadth_trend"] = breadth_res
-        else:
-            missing.append("breadth_trend")
-    except Exception as exc:
-        missing.append(f"breadth_trend({exc})")
+    # 2. index_trend
+    idx_res, idx_exc = task_res.get("index_trend", (None, None))
+    if idx_exc is not None:
+        missing.append(f"index_trend({idx_exc})")
+    elif isinstance(idx_res, dict) and idx_res.get("data_status") != "unavailable" and not idx_res.get("error"):
+        payload["index_trend"] = idx_res.get("indices", {})
+        # 交易日期一律以指数K线的真实最新交易日为准；资金流信封只带采集 timestamp，不能当交易日。
+        data_date = data_date or index_latest_date(idx_res)
+    else:
+        missing.append("index_trend")
 
-    # 核心主线板块量价结构：取净流入前列板块，逐板块补 5/20/60 日区间涨幅与均线排列
+    # 3. breadth_trend
+    breadth_res, breadth_exc = task_res.get("breadth_trend", (None, None))
+    if breadth_exc is not None:
+        missing.append(f"breadth_trend({breadth_exc})")
+    elif isinstance(breadth_res, dict) and breadth_res.get("data_status") != "unavailable" and not breadth_res.get("error"):
+        payload["breadth_trend"] = breadth_res
+    else:
+        missing.append("breadth_trend")
+
+    # 核心主线板块量价结构：取净流入前列板块，并发补 5/20/60 日区间涨幅与均线排列
     dominant_sectors: List[Dict[str, Any]] = []
     dominant_failed: List[str] = []
     fund_payload = payload.get("sector_fund_flows") or {}
@@ -3162,31 +3222,34 @@ def fetch_rotation_context(
         for item in (fund_payload.get("top_inflow_sectors") or [])
         if isinstance(item, dict) and item.get("name")
     ][: min(sector_count, 5)]
-    for name in leader_names:
-        try:
-            kline_res = fetch_sector_kline(name, count=max(60, days))
-        except Exception:
-            dominant_failed.append(name)
-            continue
-        if not isinstance(kline_res, dict) or kline_res.get("error") or kline_res.get("data_status") == "unavailable":
-            dominant_failed.append(name)
-            continue
-        dominant_sectors.append({
-            "name": kline_res.get("sector_name") or name,
-            "code": kline_res.get("sector_code"),
-            "data_status": kline_res.get("data_status"),
-            "valid_bars": kline_res.get("valid_bars"),
-            "recent_5d_return": kline_res.get("recent_5d_return"),
-            "recent_20d_return": kline_res.get("recent_20d_return"),
-            "recent_60d_return": kline_res.get("recent_60d_return"),
-            "ma5": kline_res.get("ma5"),
-            "ma10": kline_res.get("ma10"),
-            "ma20": kline_res.get("ma20"),
-            "ma60": kline_res.get("ma60"),
-            "latest_close": kline_res.get("latest_close"),
-            "avg_amount_5d_billion": kline_res.get("avg_amount_5d_billion"),
-            "ma_alignment": _describe_ma_alignment(kline_res),
-        })
+
+    if leader_names:
+        sector_tasks = {
+            name: (lambda n=name: fetch_sector_kline(n, count=max(60, days)))
+            for name in leader_names
+        }
+        sec_kline_res = _run_parallel_tasks(sector_tasks, max_workers=5)
+        for name in leader_names:
+            kline_res, k_exc = sec_kline_res.get(name, (None, None))
+            if k_exc is not None or not isinstance(kline_res, dict) or kline_res.get("error") or kline_res.get("data_status") == "unavailable":
+                dominant_failed.append(name)
+                continue
+            dominant_sectors.append({
+                "name": kline_res.get("sector_name") or name,
+                "code": kline_res.get("sector_code"),
+                "data_status": kline_res.get("data_status"),
+                "valid_bars": kline_res.get("valid_bars"),
+                "recent_5d_return": kline_res.get("recent_5d_return"),
+                "recent_20d_return": kline_res.get("recent_20d_return"),
+                "recent_60d_return": kline_res.get("recent_60d_return"),
+                "ma5": kline_res.get("ma5"),
+                "ma10": kline_res.get("ma10"),
+                "ma20": kline_res.get("ma20"),
+                "ma60": kline_res.get("ma60"),
+                "latest_close": kline_res.get("latest_close"),
+                "avg_amount_5d_billion": kline_res.get("avg_amount_5d_billion"),
+                "ma_alignment": _describe_ma_alignment(kline_res),
+            })
     if dominant_sectors:
         payload["dominant_sectors_kline"] = {
             "sectors": dominant_sectors,
@@ -3232,81 +3295,94 @@ def fetch_stock_diagnostic_context(
     archetype_hints: Optional[Dict[str, Any]] = None,
     position_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """聚合个股证据并预计算数据模式、生态分型、威科夫适用性和持仓场景。"""
+    """聚合个股证据并预计算数据模式、生态分型、威科夫适用性和持仓场景（并发多线程）。"""
     missing: List[str] = []
     conflicts: List[str] = []
     payload: Dict[str, Any] = {}
     data_date = None
 
-    try:
-        quote_res = fetch_stock_quote(symbol)
-        if isinstance(quote_res, dict) and quote_res.get("data_status") != "unavailable" and not quote_res.get("error"):
-            payload["quote"] = quote_res
-            data_date = normalize_date(quote_res.get("as_of"))
-        else:
-            missing.append("quote")
-    except Exception as exc:
-        missing.append(f"quote({exc})")
-
-    try:
-        kline_res = fetch_stock_kline(symbol, count=750, compact=True)
-        if isinstance(kline_res, dict) and kline_res.get("data_status") != "unavailable" and not kline_res.get("error"):
-            payload["kline_structure"] = kline_res
-            if not data_date:
-                data_date = normalize_date(kline_res.get("latest_date"))
-        else:
-            missing.append("kline_structure")
-    except Exception as exc:
-        missing.append(f"kline_structure({exc})")
-
-    try:
-        quality_res = fetch_company_quality(symbol)
-        if isinstance(quality_res, dict) and quality_res.get("data_status") != "unavailable" and not quality_res.get("error"):
-            payload["company_quality"] = quality_res
-        else:
-            missing.append("company_quality")
-    except Exception as exc:
-        missing.append(f"company_quality({exc})")
-
-    try:
-        timeline_res = fetch_stock_timeline(symbol)
-        if isinstance(timeline_res, dict) and timeline_res.get("data_status") != "unavailable" and not timeline_res.get("error"):
-            payload["timeline"] = timeline_res
-        else:
-            missing.append("timeline")
-    except Exception as exc:
-        missing.append(f"timeline({exc})")
-
-    try:
-        lhb_res = fetch_longhubang_detail(symbol=symbol)
-        if isinstance(lhb_res, dict) and not lhb_res.get("error"):
-            payload["longhubang"] = lhb_res
-        else:
-            payload["longhubang"] = {"status": "none", "message": "近期无公开龙虎榜异动"}
-    except Exception:
-        payload["longhubang"] = {"status": "unavailable", "message": "龙虎榜接口暂时不可用"}
-
-    try:
-        bm_key = benchmark or "CSIALL"
-        idx_res = fetch_index_kline([bm_key], count=130)
-        if isinstance(idx_res, dict) and idx_res.get("data_status") != "unavailable" and not idx_res.get("error"):
-            payload["benchmark_kline"] = idx_res.get("indices", {})
-        else:
-            missing.append("benchmark_kline")
-    except Exception as exc:
-        missing.append(f"benchmark_kline({exc})")
-
+    bm_key = benchmark or "CSIALL"
+    tasks = {
+        "quote": lambda: fetch_stock_quote(symbol),
+        "kline_structure": lambda: fetch_stock_kline(symbol, count=750, compact=True),
+        "company_quality": lambda: fetch_company_quality(symbol),
+        "timeline": lambda: fetch_stock_timeline(symbol),
+        "longhubang": lambda: fetch_longhubang_detail(symbol=symbol),
+        "benchmark_kline": lambda: fetch_index_kline([bm_key], count=130),
+    }
     if sector:
-        try:
-            sector_res = fetch_sector_kline(sector, count=130)
-            if isinstance(sector_res, dict) and sector_res.get("data_status") != "unavailable" and not sector_res.get("error"):
-                payload["sector_kline"] = sector_res
-            else:
-                missing.append("sector_kline")
-        except Exception as exc:
-            missing.append(f"sector_kline({exc})")
+        tasks["sector_kline"] = lambda: fetch_sector_kline(sector, count=130)
     else:
         missing.append("sector_kline(sector_not_provided)")
+
+    task_res = _run_parallel_tasks(tasks, max_workers=6)
+
+    # 1. quote
+    quote_res, quote_exc = task_res.get("quote", (None, None))
+    if quote_exc is not None:
+        missing.append(f"quote({quote_exc})")
+    elif isinstance(quote_res, dict) and quote_res.get("data_status") != "unavailable" and not quote_res.get("error"):
+        payload["quote"] = quote_res
+        data_date = normalize_date(quote_res.get("as_of"))
+    else:
+        missing.append("quote")
+
+    # 2. kline_structure
+    kline_res, kline_exc = task_res.get("kline_structure", (None, None))
+    if kline_exc is not None:
+        missing.append(f"kline_structure({kline_exc})")
+    elif isinstance(kline_res, dict) and kline_res.get("data_status") != "unavailable" and not kline_res.get("error"):
+        payload["kline_structure"] = kline_res
+        if not data_date:
+            data_date = normalize_date(kline_res.get("latest_date"))
+    else:
+        missing.append("kline_structure")
+
+    # 3. company_quality
+    quality_res, quality_exc = task_res.get("company_quality", (None, None))
+    if quality_exc is not None:
+        missing.append(f"company_quality({quality_exc})")
+    elif isinstance(quality_res, dict) and quality_res.get("data_status") != "unavailable" and not quality_res.get("error"):
+        payload["company_quality"] = quality_res
+    else:
+        missing.append("company_quality")
+
+    # 4. timeline
+    timeline_res, timeline_exc = task_res.get("timeline", (None, None))
+    if timeline_exc is not None:
+        missing.append(f"timeline({timeline_exc})")
+    elif isinstance(timeline_res, dict) and timeline_res.get("data_status") != "unavailable" and not timeline_res.get("error"):
+        payload["timeline"] = timeline_res
+    else:
+        missing.append("timeline")
+
+    # 5. longhubang
+    lhb_res, lhb_exc = task_res.get("longhubang", (None, None))
+    if lhb_exc is not None:
+        payload["longhubang"] = {"status": "unavailable", "message": "龙虎榜接口暂时不可用"}
+    elif isinstance(lhb_res, dict) and not lhb_res.get("error"):
+        payload["longhubang"] = lhb_res
+    else:
+        payload["longhubang"] = {"status": "none", "message": "近期无公开龙虎榜异动"}
+
+    # 6. benchmark_kline
+    bm_res, bm_exc = task_res.get("benchmark_kline", (None, None))
+    if bm_exc is not None:
+        missing.append(f"benchmark_kline({bm_exc})")
+    elif isinstance(bm_res, dict) and bm_res.get("data_status") != "unavailable" and not bm_res.get("error"):
+        payload["benchmark_kline"] = bm_res.get("indices", {})
+    else:
+        missing.append("benchmark_kline")
+
+    # 7. sector_kline
+    if sector:
+        sec_res, sec_exc = task_res.get("sector_kline", (None, None))
+        if sec_exc is not None:
+            missing.append(f"sector_kline({sec_exc})")
+        elif isinstance(sec_res, dict) and sec_res.get("data_status") != "unavailable" and not sec_res.get("error"):
+            payload["sector_kline"] = sec_res
+        else:
+            missing.append("sector_kline")
 
     kline = payload.get("kline_structure", {})
     quote = payload.get("quote", {})

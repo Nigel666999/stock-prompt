@@ -9,9 +9,9 @@
 | 指标项 | 统计值 | 说明 |
 |---|---|---|
 | **测试模块数** | 34 个测试模块 | 分布于 `tests/` 目录 |
-| **测试用例总数** | **318 个单元与集成测试** | 涵盖确定性数学计算、实盘战法门禁、MCP 数据网关、网络传输容灾与缓存治理等 |
-| **测试执行耗时** | ~3.7 秒 | 全量纯 Python 本地快速执行，无需外部网络依赖 |
-| **测试通过率** | **100% (318/318 OK)** | 零失败、零警告、零退化 |
+| **测试用例总数** | **322 个单元与集成测试** | 涵盖确定性数学计算、实盘战法门禁、MCP 数据网关、并发多线程与动态诊断等 |
+| **测试执行耗时** | ~4.0 秒 | 全量纯 Python 本地快速执行，无需外部网络依赖 |
+| **测试通过率** | **100% (322/322 OK)** | 零失败、零警告、零退化 |
 | **测试环境要求** | Python 3.10+ | 仅依赖标准库 `unittest` + 可选 `Pillow` (用于战报渲染校验) |
 
 ---
@@ -93,7 +93,7 @@
 | [`test_artifact_pipeline.py`](../tests/test_artifact_pipeline.py) | 7 | 竞价快照不可覆盖盘前快照、双写失败平滑降级仅告警、低覆盖率强制移除精确概率与分值 |
 | [`test_handoff_store.py`](../tests/test_handoff_store.py) | 12 | 跨 Skill 交接摘要的校验、读写、原子落盘、交易日窗口过滤与安全回滚 |
 | [`test_thesis_store.py`](../tests/test_thesis_store.py) | 4 | 个股长期投资逻辑 (Thesis Ledger) 写入、更新历史保留、触发器结构化核验 |
-| [`test_eval_tracker.py`](../tests/test_eval_tracker.py) | 28 | 预测评估台账：record (盘前记录)、result (收盘对账)、record-daily (情绪与主线记录)、replay (滚动回放)、misses (漏判主线复盘)、report (Brier与命中率报告) |
+| [`test_eval_tracker.py`](../tests/test_eval_tracker.py) | 29 | 预测评估台账：record (盘前记录)、result (收盘对账)、record-daily (情绪与主线记录)、replay (滚动回放)、misses (漏判主线复盘)、report (Brier与命中率报告)、换行缺失保护与安全落盘 |
 | [`test_eval_tracker_versioning.py`](../tests/test_eval_tracker_versioning.py) | 3 | 台账数据 Schema、模型与公式版本自动迁移机制 |
 | [`test_review_insights.py`](../tests/test_review_insights.py) | 13 | 周度/月度复盘洞察摘要生成器与多主线迁移矩阵 |
 | [`test_stock_prompt_cli.py`](../tests/test_stock_prompt_cli.py) | 6 | `scripts/stock_prompt.py` 统一 CLI 子命令转发与调用 |
@@ -107,7 +107,7 @@
 | 测试文件 | 用例数 | 核心验证内容 |
 |---|:---:|---|
 | [`test_mcp_server.py`](../tests/test_mcp_server.py) | 74 | 21 个 MCP 原生工具的 Mock 网络传输与解析；内存缓存 LRU 淘汰与主动清扫；HTTP 退避重试与断路器半开自愈探测 |
-| [`test_mcp_context_tools.py`](../tests/test_mcp_context_tools.py) | 27 | 核心上下文聚合网关：收盘复盘证据包 (`get_close_review_context`)、轮动证据包 (`get_rotation_context`)、盘前证据包 (`get_prediction_context`)、个股诊断证据包 (`get_stock_diagnostic_context`) 的聚合与降级逻辑 |
+| [`test_mcp_context_tools.py`](../tests/test_mcp_context_tools.py) | 29 | 核心上下文聚合网关：收盘复盘证据包 (`get_close_review_context`)、轮动证据包 (`get_rotation_context`)、盘前证据包 (`get_prediction_context`)、个股诊断证据包 (`get_stock_diagnostic_context`) 的并发抓取、聚合与降级逻辑 |
 
 ---
 

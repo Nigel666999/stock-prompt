@@ -586,6 +586,17 @@ class MigrateLedgerTest(unittest.TestCase):
             self.assertEqual(changed, 0)
             self.assertIn("无需迁移", out.getvalue())
 
+    def test_append_record_handles_missing_trailing_newline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ledger.jsonl"
+            # 模拟此前写入中断导致的无末尾换行符
+            path.write_text('{"type": "init"}', encoding="utf-8")
+            TRACKER.append_record(str(path), {"type": "second"})
+            lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0]["type"], "init")
+            self.assertEqual(lines[1]["type"], "second")
+
 
 if __name__ == "__main__":
     unittest.main()

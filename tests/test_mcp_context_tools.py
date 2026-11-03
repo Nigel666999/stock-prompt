@@ -420,6 +420,47 @@ class MCPContextToolsTest(unittest.TestCase):
             self.assertEqual(res["source"], "P3_MarketGraph_Rotation")
             self.assertIn("payload", res["data"])
 
+    def test_run_parallel_tasks_success_and_fault_isolation(self):
+        """测试 _run_parallel_tasks 并发收集结果及故障隔离能力。"""
+        def task_ok():
+            return {"val": 100}
+
+        def task_fail():
+            raise TimeoutError("upstream timeout")
+
+        tasks = {
+            "ok_item": task_ok,
+            "fail_item": task_fail,
+        }
+        results = SERVER._run_parallel_tasks(tasks, max_workers=2)
+        self.assertIn("ok_item", results)
+        self.assertIn("fail_item", results)
+        res_ok, exc_ok = results["ok_item"]
+        self.assertEqual(res_ok, {"val": 100})
+        self.assertIsNone(exc_ok)
+
+        res_fail, exc_fail = results["fail_item"]
+        self.assertIsNone(res_fail)
+        self.assertIsInstance(exc_fail, TimeoutError)
+
+    def test_close_review_context_concurrency_fault_tolerance(self):
+        """测试收盘复盘在部分数据源网络超时时，其余并发任务不受影响并正确记录 missing。"""
+        mock_idx = {
+            "source": "P3_Eastmoney_Index_Kline", "data_status": "ok",
+            "indices": {"SHCI": {"latest_close": 3000.0, "change_pct": "+0.5%"}},
+        }
+        with patch.object(SERVER, "fetch_index_kline", return_value=mock_idx), \
+             patch.object(SERVER, "fetch_market_sentiment", side_effect=TimeoutError("sentiment net timeout")), \
+             patch.object(SERVER, "fetch_market_breadth", return_value={"data_status": "ok", "red_rate": "55%"}), \
+             patch.object(SERVER, "fetch_sector_fund_flow", return_value={"data_status": "ok", "rankings": []}), \
+             patch.object(SERVER, "fetch_limit_up_ladder", return_value={"data_status": "ok"}), \
+             patch.object(SERVER, "fetch_longhubang_detail", return_value={"data_status": "ok"}):
+
+            res = SERVER.fetch_close_review_context(top_sectors_count=3)
+            self.assertEqual(res["data_status"], "partial")
+            self.assertIn("indices", res["payload"])
+            self.assertTrue(any("sentiment" in m for m in res["missing"]))
+
 
 if __name__ == "__main__":
     unittest.main()

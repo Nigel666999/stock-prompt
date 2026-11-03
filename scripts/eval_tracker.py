@@ -203,8 +203,25 @@ def append_record(path, rec):
         os.chmod(directory, 0o700)
     except OSError:
         pass
+
+    # 检查若已有文件末尾非换行符，先补齐换行，防止半行拼接破坏台账 JSONL 结构
+    need_newline = False
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        try:
+            with open(path, "rb") as f_check:
+                f_check.seek(-1, os.SEEK_END)
+                need_newline = f_check.read(1) != b"\n"
+        except OSError:
+            pass
+
+    line_to_write = ("\n" if need_newline else "") + json.dumps(rec, ensure_ascii=False) + "\n"
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.write(line_to_write)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
     try:
         os.chmod(path, 0o600)
     except OSError:

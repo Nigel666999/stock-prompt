@@ -118,11 +118,55 @@ def thesis_status(state_base):
     return {"total": total, "pending_triggers": pending, "due_soon": due_soon}
 
 
-def collect_status():
+def check_network_latency(timeout: float = 2.5):
+    """动态探测核心金融行情数据源的网络连通性与往返延迟。"""
+    import time
+    import urllib.request
+
+    targets = [
+        ("腾讯行情源", "https://qt.gtimg.cn/q=s_sh000001", "qt.gtimg.cn"),
+        ("东方财富快照", "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=1&po=1&np=1&ut=bd1d9acb0402053770f4b24e5c3e483a&fltt=2&invt=2&fid=f3&fs=m:1+t:2,m:1+t:23&fields=f12,f14", "push2.eastmoney.com"),
+        ("同花顺数据中心", "https://data.10jqka.com.cn/", "data.10jqka.com.cn"),
+    ]
+    results = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    for label, url, host in targets:
+        start = time.perf_counter()
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                _ = resp.read(1024)
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+            results.append({
+                "name": label,
+                "host": host,
+                "status": "ok",
+                "latency_ms": elapsed_ms,
+                "error": None,
+            })
+        except Exception as exc:
+            results.append({
+                "name": label,
+                "host": host,
+                "status": "failed",
+                "latency_ms": None,
+                "error": str(exc),
+            })
+    ok_count = sum(1 for item in results if item["status"] == "ok")
+    overall = "ok" if ok_count == len(results) else ("degraded" if ok_count > 0 else "offline")
+    return {
+        "overall": overall,
+        "available_count": ok_count,
+        "total_count": len(results),
+        "targets": results,
+    }
+
+
+def collect_status(check_ping: bool = False):
     skills = {item["id"]: resolve_path(item["source"]).is_dir() for item in REGISTRY["skills"]}
     state_base = Path(os.environ.get("STOCK_PROMPT_STATE_HOME") or os.environ.get("STOCK_PROMPT_HOME") or (Path.home() / ".stock-prompt"))
     parity_errors = collect_errors()
-    return {
+    status_payload = {
         "project_version": REGISTRY["project"]["version"],
         "version_parity": {"ok": not parity_errors, "errors": parity_errors},
         "skills": {"ready": sum(skills.values()), "total": len(skills), "details": skills},
@@ -144,13 +188,17 @@ def collect_status():
             "theses": permission_status(state_base / "theses", 0o700),
         },
     }
+    if check_ping:
+        status_payload["network"] = check_network_latency()
+    return status_payload
 
 
 def main():
     parser = argparse.ArgumentParser(description="诊断 stock-prompt 安装与运行环境（只读）")
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    parser.add_argument("--ping", action="store_true", help="动态探测核心金融数据源网络连通性与往返延迟")
     args = parser.parse_args()
-    status = collect_status()
+    status = collect_status(check_ping=args.ping)
     if args.json:
         print(json.dumps(status, ensure_ascii=False, indent=2))
     else:
@@ -173,6 +221,14 @@ def main():
         print(thesis_line)
         insecure = [name for name, item in status["state_permissions"].items() if not item["secure"]]
         print(f"状态目录权限: {'安全' if not insecure else '需收紧 ' + ','.join(insecure)}")
+        if args.ping and "network" in status:
+            net = status["network"]
+            print(f"数据源动态连通性: {'全部正常' if net['overall'] == 'ok' else ('部分降级' if net['overall'] == 'degraded' else '完全不可用')}")
+            for item in net["targets"]:
+                if item["status"] == "ok":
+                    print(f"  - {item['name']} ({item['host']}): 正常 ({item['latency_ms']}ms)")
+                else:
+                    print(f"  - {item['name']} ({item['host']}): 异常 ({item['error']})")
     failed = not status["version_parity"]["ok"] or status["skills"]["ready"] != status["skills"]["total"]
     return 1 if failed else 0
 
